@@ -23,17 +23,18 @@ const activeConnections = new Map();
 
 // --- WEBSOCKET OCPP SERVER ---
 wss.on('connection', (ws, req) => {
-  // A URL esperada é algo como ws://host:port/ocpp/WEMOB-001
-  const urlParts = req.url.split('/');
-  const chargePointId = urlParts[urlParts.length - 1];
-
-  if (!chargePointId || chargePointId === 'ocpp') {
-    console.log('[OCPP] Conexão rejeitada: ID do carregador não fornecido na URL.');
-    ws.close();
+  // Validação estrita da rota: deve ser exatamente /ocpp/:chargePointId
+  const urlMatch = req.url.match(/^\/ocpp\/(.+)$/);
+  
+  if (!urlMatch) {
+    console.warn(`[OCPP] Conexão rejeitada: Rota inválida (${req.url}). Esperado /ocpp/:chargePointId`);
+    ws.close(1008, 'Invalid route'); // 1008 Policy Violation
     return;
   }
 
-  console.log(`[OCPP] Carregador conectado: ${chargePointId}`);
+  const chargePointId = urlMatch[1];
+  console.log(`[OCPP] [${chargePointId}] Carregador conectado na rota ${req.url}`);
+  
   activeConnections.set(chargePointId, ws);
 
   // Atualiza ou registra o carregador
@@ -55,14 +56,24 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.on('message', (message) => {
+    let parsed;
+    
+    // Tratamento de erro de JSON
     try {
-      const parsed = JSON.parse(message);
-      
+      parsed = JSON.parse(message);
+    } catch (err) {
+      console.error(`[OCPP] [${chargePointId}] Erro de Parse JSON. Mensagem recebida:`, message.toString());
+      return; // Ignora mensagens malformadas
+    }
+    
+    try {
       // Mensagem OCPP CALL: [2, "UniqueId", "Action", { Payload }]
       if (Array.isArray(parsed) && parsed[0] === 2) {
         const [messageTypeId, messageId, action, payload] = parsed;
         
-        // Registrar evento
+        console.log(`[OCPP] [${chargePointId}] Recebeu CALL: ${action}`, JSON.stringify(payload));
+
+        // Registrar evento no histórico
         events.unshift({
           id: crypto.randomUUID(),
           charge_point_id: chargePointId,
@@ -79,20 +90,28 @@ wss.on('connection', (ws, req) => {
         let responsePayload = {};
         
         if (action === 'BootNotification') {
+          console.log(`[OCPP] [${chargePointId}] Processando BootNotification (Vendor: ${payload.chargePointVendor}, Model: ${payload.chargePointModel})`);
           responsePayload = { status: 'Accepted', currentTime: new Date().toISOString(), interval: 300 };
           if (payload.chargePointVendor) charger.fabricante = payload.chargePointVendor;
           if (payload.chargePointModel) charger.modelo = payload.chargePointModel;
+          
         } else if (action === 'Heartbeat') {
+          console.log(`[OCPP] [${chargePointId}] Processando Heartbeat`);
           responsePayload = { currentTime: new Date().toISOString() };
           charger.ultimo_heartbeat = new Date().toISOString();
+          
         } else if (action === 'StatusNotification') {
+          console.log(`[OCPP] [${chargePointId}] Processando StatusNotification (Conector ${payload.connectorId}: ${payload.status})`);
           responsePayload = {};
           if (charger.connectors) {
             const conn = charger.connectors.find(c => c.connector_number === payload.connectorId);
             if (conn) conn.status = payload.status;
           }
+          
         } else if (action === 'StartTransaction') {
           const transactionId = Math.floor(Math.random() * 1000000);
+          console.log(`[OCPP] [${chargePointId}] Processando StartTransaction (Conector ${payload.connectorId}, Nova Transação: ${transactionId})`);
+          
           responsePayload = {
             transactionId: transactionId,
             idTagInfo: { status: 'Accepted' }
@@ -116,22 +135,29 @@ wss.on('connection', (ws, req) => {
             const conn = charger.connectors.find(c => c.connector_number === payload.connectorId);
             if (conn) conn.status = 'Occupied';
           }
+          
         } else if (action === 'MeterValues') {
           responsePayload = {};
           const session = sessions.find(s => s.transaction_id === payload.transactionId && s.status === 'Charging');
+          
           if (session && payload.meterValue && payload.meterValue.length > 0) {
-            // Tenta encontrar o valor de energia (geralmente o primeiro ou filtrando por measurand)
             const meterValue = payload.meterValue[payload.meterValue.length - 1];
             const energyValue = meterValue.sampledValue.find(sv => sv.measurand === 'Energy.Active.Import.Register' || !sv.measurand);
             
             if (energyValue) {
               let value = parseFloat(energyValue.value);
-              // Se a unidade for Wh, converte para kWh
               if (energyValue.unit === 'Wh') value = value / 1000;
               session.energy_kwh = value;
+              console.log(`[OCPP] [${chargePointId}] Processando MeterValues (Transação ${payload.transactionId}, Energia Atual: ${value.toFixed(2)} kWh)`);
+            } else {
+              console.log(`[OCPP] [${chargePointId}] Processando MeterValues (Transação ${payload.transactionId}, Sem leitura de energia ativa)`);
             }
+          } else {
+            console.log(`[OCPP] [${chargePointId}] Processando MeterValues (Sessão não encontrada ou sem valores para Transação ${payload.transactionId})`);
           }
+          
         } else if (action === 'StopTransaction') {
+          console.log(`[OCPP] [${chargePointId}] Processando StopTransaction (Transação ${payload.transactionId})`);
           responsePayload = {
             idTagInfo: { status: 'Accepted' }
           };
@@ -141,37 +167,50 @@ wss.on('connection', (ws, req) => {
             session.ended_at = payload.timestamp || new Date().toISOString();
             session.status = 'Completed';
             
-            // Se meterStop for fornecido, atualiza a energia final
             if (payload.meterStop !== undefined) {
-              // Assume-se que meterStop está na mesma unidade do meterStart (geralmente Wh ou kWh)
-              // Aqui simplificamos: se for um valor muito alto, provavelmente é Wh
               let finalEnergy = parseFloat(payload.meterStop);
               if (finalEnergy > 10000) finalEnergy = finalEnergy / 1000; 
               session.energy_kwh = finalEnergy;
+              console.log(`[OCPP] [${chargePointId}] Transação ${payload.transactionId} finalizada com ${session.energy_kwh.toFixed(2)} kWh`);
             }
           }
 
           // Liberar conector
           if (charger.connectors) {
-            // StopTransaction nem sempre traz o connectorId, mas podemos inferir da sessão
             const connectorId = session ? session.connector_id : 1;
             const conn = charger.connectors.find(c => c.connector_number === connectorId);
             if (conn) conn.status = 'Available';
           }
+        } else {
+          console.log(`[OCPP] [${chargePointId}] Ação não tratada especificamente: ${action}`);
         }
 
         // Enviar resposta CALLRESULT: [3, "UniqueId", { Payload }]
+        console.log(`[OCPP] [${chargePointId}] Enviando CALLRESULT para ${action}:`, JSON.stringify(responsePayload));
         ws.send(JSON.stringify([3, messageId, responsePayload]));
+        
+      } else if (Array.isArray(parsed) && parsed[0] === 3) {
+        // Mensagem OCPP CALLRESULT: [3, "UniqueId", { Payload }]
+        console.log(`[OCPP] [${chargePointId}] Recebeu CALLRESULT (Id: ${parsed[1]}):`, JSON.stringify(parsed[2]));
+      } else if (Array.isArray(parsed) && parsed[0] === 4) {
+        // Mensagem OCPP CALLERROR: [4, "UniqueId", "ErrorCode", "ErrorDescription", { ErrorDetails }]
+        console.error(`[OCPP] [${chargePointId}] Recebeu CALLERROR (Id: ${parsed[1]}):`, parsed[2], parsed[3]);
+      } else {
+        console.warn(`[OCPP] [${chargePointId}] Formato de mensagem OCPP desconhecido:`, parsed);
       }
     } catch (err) {
-      console.error(`[OCPP] Erro ao processar mensagem de ${chargePointId}:`, err);
+      console.error(`[OCPP] [${chargePointId}] Erro interno ao processar mensagem:`, err);
     }
   });
 
-  ws.on('close', () => {
-    console.log(`[OCPP] Carregador desconectado: ${chargePointId}`);
+  ws.on('close', (code, reason) => {
+    console.log(`[OCPP] [${chargePointId}] Carregador desconectado (Código: ${code}, Motivo: ${reason || 'N/A'})`);
     activeConnections.delete(chargePointId);
     if (charger) charger.status = 'Offline';
+  });
+  
+  ws.on('error', (error) => {
+    console.error(`[OCPP] [${chargePointId}] Erro na conexão WebSocket:`, error);
   });
 });
 
@@ -240,6 +279,7 @@ const sendCommand = (chargerId, action, payload, res) => {
   const messageId = crypto.randomUUID();
   const message = [2, messageId, action, payload];
   
+  console.log(`[OCPP] [${charger.charge_point_id}] Enviando Comando Remoto (${action}):`, JSON.stringify(payload));
   ws.send(JSON.stringify(message));
   
   events.unshift({
