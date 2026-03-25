@@ -91,6 +91,73 @@ wss.on('connection', (ws, req) => {
             const conn = charger.connectors.find(c => c.connector_number === payload.connectorId);
             if (conn) conn.status = payload.status;
           }
+        } else if (action === 'StartTransaction') {
+          const transactionId = Math.floor(Math.random() * 1000000);
+          responsePayload = {
+            transactionId: transactionId,
+            idTagInfo: { status: 'Accepted' }
+          };
+          
+          // Criar nova sessão
+          sessions.unshift({
+            id: crypto.randomUUID(),
+            charger_id: charger.id,
+            charge_point_id: chargePointId,
+            connector_id: payload.connectorId,
+            transaction_id: transactionId,
+            started_at: payload.timestamp || new Date().toISOString(),
+            ended_at: null,
+            energy_kwh: 0,
+            status: 'Charging'
+          });
+
+          // Atualizar status do conector
+          if (charger.connectors) {
+            const conn = charger.connectors.find(c => c.connector_number === payload.connectorId);
+            if (conn) conn.status = 'Occupied';
+          }
+        } else if (action === 'MeterValues') {
+          responsePayload = {};
+          const session = sessions.find(s => s.transaction_id === payload.transactionId && s.status === 'Charging');
+          if (session && payload.meterValue && payload.meterValue.length > 0) {
+            // Tenta encontrar o valor de energia (geralmente o primeiro ou filtrando por measurand)
+            const meterValue = payload.meterValue[payload.meterValue.length - 1];
+            const energyValue = meterValue.sampledValue.find(sv => sv.measurand === 'Energy.Active.Import.Register' || !sv.measurand);
+            
+            if (energyValue) {
+              let value = parseFloat(energyValue.value);
+              // Se a unidade for Wh, converte para kWh
+              if (energyValue.unit === 'Wh') value = value / 1000;
+              session.energy_kwh = value;
+            }
+          }
+        } else if (action === 'StopTransaction') {
+          responsePayload = {
+            idTagInfo: { status: 'Accepted' }
+          };
+          
+          const session = sessions.find(s => s.transaction_id === payload.transactionId);
+          if (session) {
+            session.ended_at = payload.timestamp || new Date().toISOString();
+            session.status = 'Completed';
+            
+            // Se meterStop for fornecido, atualiza a energia final
+            if (payload.meterStop !== undefined) {
+              // Assume-se que meterStop está na mesma unidade do meterStart (geralmente Wh ou kWh)
+              // Aqui simplificamos: se for um valor muito alto, provavelmente é Wh
+              let finalEnergy = parseFloat(payload.meterStop);
+              if (finalEnergy > 10000) finalEnergy = finalEnergy / 1000; 
+              session.energy_kwh = finalEnergy;
+            }
+          }
+
+          // Liberar conector
+          if (charger.connectors) {
+            // StopTransaction nem sempre traz o connectorId, mas podemos inferir da sessão
+            const connectorId = session ? session.connector_id : 1;
+            const conn = charger.connectors.find(c => c.connector_number === connectorId);
+            if (conn) conn.status = 'Available';
+          }
         }
 
         // Enviar resposta CALLRESULT: [3, "UniqueId", { Payload }]
