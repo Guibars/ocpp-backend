@@ -10,7 +10,12 @@ const wss = new WebSocketServer({ server });
 
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// --- CONFIGURAÇÃO DE CORS ABERTA ---
+app.use(cors({
+  origin: '*', // Permite literalmente qualquer site
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // --- IN-MEMORY STORAGE ---
