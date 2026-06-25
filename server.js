@@ -13,6 +13,23 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// --- DRIVER MAP CONFIG ---
+// Configure this in Railway Variables as JSON:
+// CHARGER_LOCATIONS={"CHARGER_ID":{"name":"Fotus Teste","address":"Rua Exemplo, 123","lat":-23.55,"lng":-46.63,"network":"Fotus","powerKw":50,"pricePerKwh":2.10}}
+function parseChargerLocations() {
+  if (!process.env.CHARGER_LOCATIONS) return {};
+
+  try {
+    const parsed = JSON.parse(process.env.CHARGER_LOCATIONS);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (error) {
+    console.error('[CONFIG] CHARGER_LOCATIONS precisa ser um JSON valido:', error.message);
+    return {};
+  }
+}
+
+let chargerLocations = parseChargerLocations();
+
 // --- IN-MEMORY STORAGE ---
 // MVP: esses dados ficam em memória. Próximo passo de produção: PostgreSQL.
 let chargers = [];
@@ -134,6 +151,46 @@ function sendCallError(ws, chargePointId, messageId, errorCode, errorDescription
 
 function findCharger(chargerId) {
   return chargers.find(c => c.id === chargerId || c.charge_point_id === chargerId);
+}
+
+function getChargerLocation(charger) {
+  if (!charger) return null;
+  return chargerLocations[charger.charge_point_id] || chargerLocations[charger.id] || charger.location || null;
+}
+
+function connectorIsAvailable(connector) {
+  return String(connector?.status || '').toLowerCase() === 'available';
+}
+
+function normalizePublicCharger(charger) {
+  const location = getChargerLocation(charger);
+  if (!location || location.lat === undefined || location.lng === undefined) return null;
+
+  const connectors = Array.isArray(charger.connectors) && charger.connectors.length > 0
+    ? charger.connectors
+    : [{ connector_number: 1, status: charger.status === 'Online' ? 'Available' : 'Unavailable' }];
+
+  return {
+    id: charger.charge_point_id,
+    chargerId: charger.id,
+    name: location.name || `Carregador ${charger.charge_point_id}`,
+    address: location.address || 'Endereco nao informado',
+    lat: Number(location.lat),
+    lng: Number(location.lng),
+    network: location.network || 'Fotus',
+    status: charger.status,
+    online: charger.status === 'Online',
+    lastSeen: charger.ultimo_heartbeat || null,
+    connectors: connectors.map(connector => ({
+      id: connector.id,
+      connectorId: connector.connector_number || 1,
+      type: location.connectorType || connector.type || 'CCS2',
+      powerKw: Number(location.powerKw || connector.powerKw || 50),
+      status: charger.status === 'Online' ? connector.status : 'Offline',
+      available: charger.status === 'Online' && connectorIsAvailable(connector),
+      pricePerKwh: Number(location.pricePerKwh || connector.pricePerKwh || 2.1)
+    }))
+  };
 }
 
 // --- WEBSOCKET OCPP SERVER ---
@@ -460,6 +517,46 @@ app.get('/api/dashboard-stats', (req, res) => {
 
 app.get('/api/events', (req, res) => {
   res.json(events.slice(0, Number(req.query.limit || 50)));
+});
+
+app.get('/chargers', (req, res) => {
+  const availableOnly = String(req.query.available || 'true') !== 'false';
+  const mappedChargers = chargers
+    .map(normalizePublicCharger)
+    .filter(Boolean)
+    .filter(charger => !availableOnly || charger.connectors.some(connector => connector.available));
+
+  res.json({ chargers: mappedChargers });
+});
+
+app.get('/api/public-chargers', (req, res) => {
+  const mappedChargers = chargers
+    .map(normalizePublicCharger)
+    .filter(Boolean);
+
+  res.json({ chargers: mappedChargers });
+});
+
+app.post('/api/chargers/:id/location', (req, res) => {
+  const charger = findCharger(req.params.id) || { charge_point_id: req.params.id };
+  const { name, address, lat, lng, network, connectorType, powerKw, pricePerKwh } = req.body;
+
+  if (lat === undefined || lng === undefined) {
+    return res.status(400).json({ error: 'lat e lng sao obrigatorios' });
+  }
+
+  chargerLocations[charger.charge_point_id] = {
+    name,
+    address,
+    lat: Number(lat),
+    lng: Number(lng),
+    network: network || 'Fotus',
+    connectorType: connectorType || 'CCS2',
+    powerKw: Number(powerKw || 50),
+    pricePerKwh: Number(pricePerKwh || 2.1)
+  };
+
+  res.json({ success: true, charger: normalizePublicCharger(charger) });
 });
 
 app.get('/api/chargers', (req, res) => {
