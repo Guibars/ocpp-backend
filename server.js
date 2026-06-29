@@ -17,6 +17,13 @@ const OCPP_16_SUBPROTOCOLS = new Set([
   'ocpp16j'
 ]);
 
+const OCPP_ROUTE_PREFIXES = new Set([
+  'ocpp',
+  'ocppj',
+  'ws',
+  'websocket'
+]);
+
 function normalizeOcppSubprotocol(protocol) {
   return String(protocol || '').trim().toLowerCase().replace(/\s+/g, '');
 }
@@ -24,7 +31,10 @@ function normalizeOcppSubprotocol(protocol) {
 function selectOcppSubprotocol(protocols) {
   const offered = Array.from(protocols || []);
   const compatible = offered.find(protocol => OCPP_16_SUBPROTOCOLS.has(normalizeOcppSubprotocol(protocol)));
-  return compatible || offered[0] || false;
+  if (!compatible && offered.length > 0) {
+    console.warn(`[OCPP] Nenhum subprotocolo OCPP 1.6 compativel ofertado: ${offered.join(', ')}`);
+  }
+  return compatible || false;
 }
 
 const wss = new WebSocketServer({
@@ -74,11 +84,32 @@ function normalizeChargePointId(value) {
 }
 
 function firstQueryValue(searchParams, names) {
-  for (const name of names) {
-    const value = normalizeChargePointId(searchParams.get(name));
+  const wantedNames = new Set(names.map(name => name.toLowerCase()));
+  for (const [name, rawValue] of searchParams.entries()) {
+    if (!wantedNames.has(name.toLowerCase())) continue;
+    const value = normalizeChargePointId(rawValue);
     if (value) return value;
   }
   return null;
+}
+
+function getRequestedSubprotocols(req) {
+  const header = req.headers['sec-websocket-protocol'];
+  if (!header) return [];
+  return String(header)
+    .split(',')
+    .map(protocol => protocol.trim())
+    .filter(Boolean);
+}
+
+function getClientIp(req) {
+  const forwardedFor = req.headers['x-forwarded-for'];
+  if (forwardedFor) return String(forwardedFor).split(',')[0].trim();
+  return req.socket?.remoteAddress || 'desconhecido';
+}
+
+function shouldPersistConnection(pendingIdentity, chargePointId) {
+  return !pendingIdentity && !String(chargePointId || '').startsWith('pending-');
 }
 
 function parseOcppConnectionRequest(req) {
@@ -94,8 +125,15 @@ function parseOcppConnectionRequest(req) {
     'charge_point_id',
     'chargeBoxId',
     'chargeBoxIdentity',
+    'charge_box_id',
+    'chargeboxid',
     'identity',
-    'id'
+    'id',
+    'cpid',
+    'stationId',
+    'chargingStationId',
+    'chargePointSerialNumber',
+    'chargeBoxSerialNumber'
   ]);
 
   const segments = url.pathname
@@ -104,12 +142,14 @@ function parseOcppConnectionRequest(req) {
     .map(segment => safeDecodeURIComponent(segment));
 
   if (segments.length === 0) {
-    return queryChargePointId
-      ? { valid: true, chargePointId: queryChargePointId, pendingIdentity: false }
-      : { valid: false, reason: 'rota invalida' };
+    return {
+      valid: true,
+      chargePointId: queryChargePointId,
+      pendingIdentity: !queryChargePointId
+    };
   }
 
-  if (segments[0].toLowerCase() === 'ocpp') {
+  if (OCPP_ROUTE_PREFIXES.has(segments[0].toLowerCase())) {
     const pathChargePointId = normalizeChargePointId(segments.slice(1).join('/'));
     return {
       valid: true,
@@ -119,9 +159,25 @@ function parseOcppConnectionRequest(req) {
   }
 
   if (segments.length === 1) {
+    if (queryChargePointId) {
+      return {
+        valid: true,
+        chargePointId: queryChargePointId,
+        pendingIdentity: false
+      };
+    }
+
     return {
       valid: true,
-      chargePointId: normalizeChargePointId(segments[0]) || queryChargePointId,
+      chargePointId: normalizeChargePointId(segments[0]),
+      pendingIdentity: false
+    };
+  }
+
+  if (queryChargePointId) {
+    return {
+      valid: true,
+      chargePointId: queryChargePointId,
       pendingIdentity: false
     };
   }
@@ -635,8 +691,11 @@ function getBootChargePointId(payload) {
   return normalizeChargePointId(
     payload.chargePointSerialNumber ||
     payload.chargeBoxSerialNumber ||
-    payload.meterSerialNumber ||
-    payload.chargePointModel
+    payload.chargeBoxIdentity ||
+    payload.chargePointId ||
+    payload.id ||
+    payload.identity ||
+    payload.meterSerialNumber
   );
 }
 
@@ -760,14 +819,21 @@ function sendCommand(chargerId, action, payload, res) {
 wss.on('connection', async (ws, req) => {
   const connectionRequest = parseOcppConnectionRequest(req);
   if (!connectionRequest.valid) {
-    console.warn(`[OCPP] Conexao rejeitada: ${connectionRequest.reason} (${req.url}). Esperado /ocpp/:chargePointId`);
+    console.warn(`[OCPP] Conexao rejeitada: ${connectionRequest.reason} (${req.url}). Esperado /ocpp/:chargePointId, /ocpp, /ws/:chargePointId ou identidade no BootNotification`);
     ws.close(1008, 'Invalid route');
     return;
   }
 
   let chargePointId = connectionRequest.chargePointId || `pending-${makeId()}`;
   let pendingIdentity = connectionRequest.pendingIdentity || !connectionRequest.chargePointId;
-  console.log(`[OCPP] [${chargePointId}] Carregador conectado na rota ${req.url} com subprotocolo ${ws.protocol || 'nenhum'}`);
+  const requestedSubprotocols = getRequestedSubprotocols(req);
+  const userAgent = req.headers['user-agent'] || 'desconhecido';
+  console.log(`[OCPP] [${chargePointId}] Carregador conectado na rota ${req.url} com subprotocolo ${ws.protocol || 'nenhum'}; ofertados=${requestedSubprotocols.join(', ') || 'nenhum'}; ip=${getClientIp(req)}; user-agent=${userAgent}`);
+  if (requestedSubprotocols.length > 0 && !ws.protocol) {
+    console.warn(`[OCPP] [${chargePointId}] Encerrando conexao: subprotocolo nao suportado (${requestedSubprotocols.join(', ')}). Use OCPP 1.6J.`);
+    ws.close(1002, 'Unsupported OCPP subprotocol');
+    return;
+  }
   if (pendingIdentity) {
     console.warn(`[OCPP] [${chargePointId}] Conexao sem chargePointId na URL; aguardando BootNotification para fixar a identidade.`);
   }
@@ -776,7 +842,7 @@ wss.on('connection', async (ws, req) => {
   let charger = getOrCreateChargerByChargePointId(chargePointId);
   charger.status = 'Online';
   charger.ultimo_heartbeat = nowIso();
-  if (!pendingIdentity) await persistChargerCascade(charger);
+  if (shouldPersistConnection(pendingIdentity, chargePointId)) await persistChargerCascade(charger);
 
   ws.on('message', async (message) => {
     let parsed;
@@ -799,6 +865,9 @@ wss.on('connection', async (ws, req) => {
             pendingIdentity = false;
             console.log(`[OCPP] [${chargePointId}] Identidade definida pelo BootNotification (antes: ${previousChargePointId})`);
           }
+          if (pendingIdentity) {
+            console.warn(`[OCPP] [${chargePointId}] BootNotification nao trouxe identidade unica. Configure a URL com /ocpp/{chargePointId} ou habilite serial/chargeBoxIdentity no carregador.`);
+          }
         }
 
         console.log(`[OCPP] [${chargePointId}] Recebeu CALL: ${action}`, JSON.stringify(payload));
@@ -811,13 +880,13 @@ wss.on('connection', async (ws, req) => {
           applyBootMetadata(charger, payload);
           charger.status = 'Online';
           charger.ultimo_heartbeat = nowIso();
-          await persistChargerCascade(charger);
+          if (shouldPersistConnection(pendingIdentity, chargePointId)) await persistChargerCascade(charger);
 
         } else if (action === 'Heartbeat') {
           responsePayload = { currentTime: nowIso() };
           charger.status = 'Online';
           charger.ultimo_heartbeat = nowIso();
-          await persistChargerCascade(charger);
+          if (shouldPersistConnection(pendingIdentity, chargePointId)) await persistChargerCascade(charger);
 
         } else if (action === 'Authorize') {
           responsePayload = { idTagInfo: { status: 'Accepted' } };
@@ -832,7 +901,7 @@ wss.on('connection', async (ws, req) => {
           connector.timestamp = payload.timestamp || nowIso();
           charger.status = 'Online';
           charger.ultimo_heartbeat = nowIso();
-          await persistChargerCascade(charger);
+          if (shouldPersistConnection(pendingIdentity, chargePointId)) await persistChargerCascade(charger);
 
         } else if (action === 'StartTransaction') {
           const transactionId = Math.floor(Math.random() * 1000000);
@@ -866,7 +935,7 @@ wss.on('connection', async (ws, req) => {
 
           const connector = getOrCreateConnector(charger, payload.connectorId || 1);
           connector.status = 'Occupied';
-          await persistChargerCascade(charger);
+          if (shouldPersistConnection(pendingIdentity, chargePointId)) await persistChargerCascade(charger);
 
         } else if (action === 'MeterValues') {
           responsePayload = {};
@@ -941,7 +1010,7 @@ wss.on('connection', async (ws, req) => {
           const connectorId = session ? session.connector_id : 1;
           const connector = getOrCreateConnector(charger, connectorId);
           connector.status = 'Available';
-          await persistChargerCascade(charger);
+          if (shouldPersistConnection(pendingIdentity, chargePointId)) await persistChargerCascade(charger);
 
         } else if (action === 'DataTransfer') {
           responsePayload = { status: 'Accepted' };
@@ -1019,7 +1088,7 @@ wss.on('connection', async (ws, req) => {
     if (activeConnections.get(chargePointId) === ws) activeConnections.delete(chargePointId);
     if (charger) {
       charger.status = 'Offline';
-      await persistChargerCascade(charger);
+      if (shouldPersistConnection(pendingIdentity, chargePointId)) await persistChargerCascade(charger);
     }
   });
 
